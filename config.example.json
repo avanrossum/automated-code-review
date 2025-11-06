@@ -1,0 +1,27 @@
+{
+  "lm_studio": {
+    "base_url": "http://localhost:1234/v1",
+    "api_key": "lm-studio"
+  },
+  "model": {
+    "name": "local-model",
+    "temperature": 0.1,
+    "max_tokens": 2000
+  },
+  "scan": {
+    "root_directory": "/path/to/your/repos",
+    "extensions": [".py", ".js", ".jsx", ".ts", ".tsx", ".php", ".java", ".go", ".rb", ".sh", ".bash", ".sql", ".cs"],
+    "exclude_dirs": [
+      "build",
+      "node_modules",
+      ".git",
+      "__pycache__",
+      "dist",
+      "venv",
+      ".venv",
+      "env"
+    ],
+    "save_interval": 10
+  }
+}
+

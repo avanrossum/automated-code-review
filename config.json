@@ -1,0 +1,27 @@
+{
+  "lm_studio": {
+    "base_url": "http://localhost:1234/v1",
+    "api_key": "lm-studio"
+  },
+  "model": {
+    "name": "deepseek-coder-33b-instruct",
+    "temperature": 0.8,
+    "max_tokens": 16384
+  },
+  "scan": {
+    "root_directory": "/Users/alexvanrossum/Documents/blackpulp/categorized_apps/attendance/ward-attendance",
+    "extensions": [".py", ".js", ".jsx", ".ts", ".tsx", ".php", ".java", ".go", ".rb", ".sh", ".bash", ".sql", ".cs"],
+    "exclude_dirs": [
+      "build",
+      "node_modules",
+      ".git",
+      "__pycache__",
+      "dist",
+      "venv",
+      ".venv",
+      "env"
+    ],
+    "save_interval": 10
+  }
+}
+
