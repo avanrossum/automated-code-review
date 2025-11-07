@@ -4,9 +4,12 @@
     "api_key": "lm-studio"
   },
   "model": {
-    "name": "local-model",
+    "name": "deepseek-coder-v2-lite-instruct-q4_k_s-gguf",
     "temperature": 0.1,
-    "max_tokens": 2000
+    "max_tokens": 1024,
+    "top_p": 0.2,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0
   },
   "scan": {
     "root_directory": "/path/to/your/repos",
@@ -19,7 +22,12 @@
       "dist",
       "venv",
       ".venv",
-      "env"
+      "env",
+      "vendor",
+      "cache",
+      "coverage",
+      ".pytest_cache",
+      ".mypy_cache"
     ],
     "save_interval": 10
   }

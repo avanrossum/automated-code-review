@@ -8,7 +8,7 @@ A resumable code scanner that uses local LLM models (via LM Studio) to identify 
 - ✅ **Intelligent skipping**: Only scans files that have changed (via content hashing)
 - ✅ **Crash-safe**: Saves state periodically and on interruption
 - ✅ **Progress tracking**: Detailed logging of scan progress
-- ✅ **Multiple file types**: Scans Python (.py), JavaScript (.js), React (.jsx, .tsx)
+- ✅ **Multiple file types**: Scans Python (.py), JavaScript (.js), React (.jsx, .tsx) and more
 - ✅ **Smart exclusions**: Automatically skips build dirs, node_modules, etc.
 
 ## Prerequisites
@@ -19,24 +19,36 @@ A resumable code scanner that uses local LLM models (via LM Studio) to identify 
    - DeepSeek Coder V2 (16B or 33B)
    - CodeLlama 34B
    - Qwen2.5-Coder (7B-32B)
-   - Mistral/Mixtral
 
 ## Setup
 
-### 1. Install Python dependencies
+### 1. Create a virtual environment (recommended)
 
 ```bash
-pip install openai
+# Create virtual environment
+python3 -m venv venv
+
+# Activate it
+# On macOS/Linux:
+source venv/bin/activate
+# On Windows:
+# venv\Scripts\activate
 ```
 
-### 2. Load a model in LM Studio
+### 2. Install Python dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 3. Load a model in LM Studio
 
 1. Open LM Studio
 2. Download a code-focused model (see recommendations above)
 3. Load the model and start the local server
 4. Note the API endpoint (usually `http://localhost:1234/v1`)
 
-### 3. Configure the scanner
+### 4. Configure the scanner
 
 Copy the example config file and update it with your settings:
 

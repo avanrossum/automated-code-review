@@ -1,11 +1,12 @@
 import os
 import json
 from pathlib import Path
-from openai import OpenAI
+from openai import OpenAI, APIConnectionError, APIError, APITimeoutError
 import hashlib
 from datetime import datetime
 import time
 import sys
+import re
 
 # State tracking files
 STATE_FILE = "scan_state.json"
@@ -80,51 +81,244 @@ def should_scan(file_path, content, findings_db):
     file_hash = get_file_hash(content)
     return findings_db[file_path].get('hash') != file_hash
 
-def scan_file(file_path, content, config):
-    """Send file to LLM for analysis"""
-    prompt = f"""Analyze this code for issues. Return ONLY valid JSON in this format:
+def extract_json_block(text: str) -> str | None:
+    """Extract first balanced JSON object from text"""
+    # Strip code fences
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.MULTILINE)
+    # Find first balanced JSON object
+    start = text.find('{')
+    if start == -1:
+        return None
+    depth = 0
+    for i, ch in enumerate(text[start:], start=start):
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                return text[start:i+1]
+    return None
+
+def try_parse_json(s: str) -> dict | None:
+    """Try to parse JSON, return None on failure"""
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
+def looks_binary(content: str) -> bool:
+    """Check if content looks like binary data"""
+    sample = content[:4096]
+    weird = sum(1 for ch in sample if ord(ch) == 0 or ord(ch) > 0xFFFF)
+    return weird > len(sample) * 0.05  # More than 5% weird chars
+
+def split_code(content: str, max_chars: int = 12000) -> list:
+    """Split large code files into chunks by function/class boundaries"""
+    if len(content) <= max_chars:
+        return [content]
+    
+    # Find function/class markers
+    markers = r"(?:^|\n)(?:def\s+|class\s+|function\s+|public\s+function\s+|private\s+function\s+)"
+    parts = re.split(markers, content)
+    
+    chunks, buf = [], ""
+    for p in parts:
+        if not p.strip():
+            continue
+        # Reconstruct marker if needed
+        candidate = p
+        if not p.lstrip().startswith(("def ", "class ", "function", "public function", "private function")):
+            # Check if previous part had a marker
+            if "def " in content:
+                candidate = "def " + p
+            elif "class " in content:
+                candidate = "class " + p
+        
+        if len(buf) + len(candidate) < max_chars:
+            buf += candidate
+        else:
+            if buf:
+                chunks.append(buf)
+            buf = candidate
+    
+    if buf:
+        chunks.append(buf)
+    
+    return chunks if chunks else [content]
+
+def issue_key(issue: dict) -> str:
+    """Generate a unique key for an issue to deduplicate"""
+    base = f"{issue.get('type', '')}|{issue.get('description', '')}|{issue.get('line_hint', '')}"
+    return hashlib.md5(base.encode()).hexdigest()
+
+def scan_file_chunk(file_path, content_chunk, config, chunk_context="", max_retries=3, retry_delay=2):
+    """Send a code chunk to LLM for analysis with improved prompt and JSON extraction"""
+    # Improved prompt with checklist structure for Q4 models
+    prompt = f"""You are a static analysis assistant. Output ONLY valid JSON.
+
+Schema:
 {{
   "issues": [
     {{
-      "type": "security|pattern|regression",
-      "severity": "high|medium|low",
-      "description": "what's wrong",
-      "line_hint": "relevant code snippet if applicable"
+      "type": "security" | "pattern" | "regression",
+      "severity": "high" | "medium" | "low",
+      "description": "Specific, actionable problem statement",
+      "line_hint": "One short code line or 'L<start>-L<end>' range",
+      "cwe": "CWE-### if security, else ''"
     }}
   ]
 }}
 
-File: {file_path}
+Analyze File: {file_path}
 
-```
-{content}
-```
+Checklist (answer by emitting issues that match):
+1) Security: input validation, auth/authz gaps, unsafe deserialization, SQL/ORM injection, path traversal, SSRF, shell/exec misuse, secrets in code, weak crypto, insecure TLS.
+2) Regressions: dead flags, removal of essential checks, brittle mocks, changes in error handling that swallow exceptions.
+3) Legacy patterns: deprecated APIs, Python2 remnants, outdated PHP/React idioms, synchronous IO in async paths, global mutable state, tight coupling.
 
-If no issues found, return {{"issues": []}}
+Rules:
+- If unsure, omit the issue (prefer precision).
+- Prefer 0–5 issues; no filler.
+- Use **one line** or a small **line range** in line_hint.
+- If no issues, return {{"issues":[]}} exactly.
+
+Code:
+{chunk_context}
+{content_chunk}
 """
     
-    try:
-        response = client.chat.completions.create(
-            model=config['model']['name'],
-            messages=[{"role": "user", "content": prompt}],
-            temperature=config['model']['temperature'],
-            max_tokens=config['model']['max_tokens']
+    # Get model config with defaults
+    temperature = config['model'].get('temperature', 0.1)
+    max_tokens = config['model'].get('max_tokens', 1024)
+    top_p = config['model'].get('top_p', 0.2)
+    
+    for attempt in range(max_retries):
+        try:
+            # Build request params
+            request_params = {
+                "model": config['model']['name'],
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "timeout": 60.0
+            }
+            
+            # Add top_p if available
+            if top_p is not None:
+                request_params["top_p"] = top_p
+            
+            response = client.chat.completions.create(**request_params)
+            
+            result = response.choices[0].message.content
+            candidate = extract_json_block(result) or result
+            parsed = try_parse_json(candidate)
+            
+            # Self-repair if JSON parsing failed
+            if not parsed:
+                log_progress(f"⚠️  JSON parse failed for {file_path}, attempting self-repair...")
+                try:
+                    repair = client.chat.completions.create(
+                        model=config['model']['name'],
+                        messages=[
+                            {"role": "system", "content": "Return ONLY valid minified JSON. No code fences. No commentary."},
+                            {"role": "user", "content": f"Fix this to valid JSON matching schema {{'issues':[{{'type':'security|pattern|regression','severity':'high|medium|low','description':'','line_hint':'','cwe':''}}]}}:\n{candidate[:6000]}"}
+                        ],
+                        temperature=0.0,
+                        max_tokens=512,
+                        timeout=30.0
+                    )
+                    repaired = extract_json_block(repair.choices[0].message.content) or repair.choices[0].message.content
+                    parsed = try_parse_json(repaired)
+                except Exception as repair_error:
+                    log_progress(f"⚠️  Self-repair failed: {repair_error}")
+            
+            if not parsed:
+                log_progress(f"⚠️  JSON decode error for {file_path}: model returned non-JSON.")
+                return {"issues": [], "error": "json_decode_error", "error_message": "Model returned non-JSON"}
+            
+            return parsed
+            
+        except APIConnectionError as e:
+            # Connection errors - retry with backoff
+            if attempt < max_retries - 1:
+                wait_time = retry_delay * (2 ** attempt)  # Exponential backoff
+                log_progress(f"Connection error for {file_path} (attempt {attempt + 1}/{max_retries}). Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                log_progress(f"❌ Connection error for {file_path} after {max_retries} attempts: {e}")
+                return {"issues": [], "error": "connection_failed", "error_message": str(e)}
+                
+        except APITimeoutError as e:
+            # Timeout errors - retry
+            if attempt < max_retries - 1:
+                wait_time = retry_delay * (2 ** attempt)
+                log_progress(f"Timeout error for {file_path} (attempt {attempt + 1}/{max_retries}). Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                log_progress(f"❌ Timeout error for {file_path} after {max_retries} attempts: {e}")
+                return {"issues": [], "error": "timeout", "error_message": str(e)}
+                
+        except APIError as e:
+            # Check for rate limits (429) or server busy (503)
+            error_str = str(e)
+            if '429' in error_str or '503' in error_str:
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)
+                    log_progress(f"Rate limit/server busy for {file_path}. Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+            # Other API errors - log and return empty
+            log_progress(f"❌ API error for {file_path}: {e}")
+            return {"issues": [], "error": "api_error", "error_message": str(e)}
+            
+        except Exception as e:
+            # Unexpected errors - log and return empty
+            log_progress(f"❌ Unexpected error analyzing {file_path}: {type(e).__name__}: {e}")
+            return {"issues": [], "error": "unknown_error", "error_message": str(e)}
+    
+    # Should never reach here, but just in case
+    return {"issues": []}
+
+def scan_file(file_path, content, config, max_retries=3, retry_delay=2):
+    """Scan a file, handling chunking for large files"""
+    # Extract file header/imports for context
+    lines = content.split('\n')
+    header_lines = []
+    for line in lines[:50]:  # First 50 lines typically have imports/header
+        if any(keyword in line for keyword in ['import', 'require', 'include', 'use', 'from', '#include', 'package']):
+            header_lines.append(line)
+    chunk_context = '\n'.join(header_lines) + '\n\n---\n\n' if header_lines else ''
+    
+    # Check if file needs chunking
+    chunks = split_code(content, max_chars=12000)
+    
+    if len(chunks) == 1:
+        # Single chunk - simple case
+        return scan_file_chunk(file_path, content, config, chunk_context, max_retries, retry_delay)
+    
+    # Multiple chunks - process each and merge
+    log_progress(f"📦 Chunking {file_path} into {len(chunks)} parts")
+    all_issues = []
+    seen_keys = set()
+    
+    for i, chunk in enumerate(chunks):
+        chunk_result = scan_file_chunk(
+            f"{file_path} (chunk {i+1}/{len(chunks)})",
+            chunk,
+            config,
+            chunk_context,
+            max_retries,
+            retry_delay
         )
         
-        result = response.choices[0].message.content
-        # Try to extract JSON if model wrapped it in markdown
-        if "```json" in result:
-            result = result.split("```json")[1].split("```")[0]
-        elif "```" in result:
-            result = result.split("```")[1].split("```")[0]
-        
-        return json.loads(result.strip())
-    except json.JSONDecodeError as e:
-        log_progress(f"JSON decode error for {file_path}: {e}")
-        return {"issues": []}
-    except Exception as e:
-        log_progress(f"Error analyzing {file_path}: {e}")
-        return {"issues": []}
+        # Deduplicate issues
+        for issue in chunk_result.get('issues', []):
+            key = issue_key(issue)
+            if key not in seen_keys:
+                seen_keys.add(key)
+                all_issues.append(issue)
+    
+    return {"issues": all_issues}
 
 def should_resume_from_folder(folder_path, state):
     """Determine if we should skip this folder (already completed)"""
@@ -198,6 +392,10 @@ def scan_repos(config):
             for file in files:
                 file_path = os.path.join(root, file)
                 
+                # Skip minified/bundled files
+                if file.endswith(('.min.js', '.min.css', '.map', '.bundle.js')):
+                    continue
+                
                 if Path(file_path).suffix not in extensions:
                     continue
                 
@@ -209,6 +407,13 @@ def scan_repos(config):
                     with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                         content = f.read()
                     
+                    # Skip binary files
+                    if looks_binary(content):
+                        log_progress(f"⚠️  Skipping binary file: {file_path}")
+                        skipped_this_session += 1
+                        state['total_files_skipped'] += 1
+                        continue
+                    
                     # Skip if already scanned this exact content
                     if not should_scan(file_path, content, findings_db):
                         skipped_this_session += 1
@@ -218,12 +423,28 @@ def scan_repos(config):
                     log_progress(f"Scanning: {file_path}")
                     analysis = scan_file(file_path, content, config)
                     
+                    # Store model metadata
+                    model_meta = {
+                        'model_name': config['model']['name'],
+                        'temperature': config['model'].get('temperature', 0.1),
+                        'max_tokens': config['model'].get('max_tokens', 1024),
+                        'top_p': config['model'].get('top_p', 0.2)
+                    }
+                    
                     findings_db[file_path] = {
                         'hash': get_file_hash(content),
                         'scanned_at': datetime.now().isoformat(),
                         'file_size': len(content),
-                        'findings': analysis.get('issues', [])
+                        'findings': analysis.get('issues', []),
+                        'model_meta': model_meta
                     }
+                    
+                    # Track errors if any
+                    if 'error' in analysis:
+                        findings_db[file_path]['scan_error'] = {
+                            'type': analysis.get('error'),
+                            'message': analysis.get('error_message', '')
+                        }
                     
                     scanned_this_session += 1
                     state['total_files_scanned'] += 1
@@ -273,9 +494,21 @@ def generate_report(findings_db):
     # Also organize by file for file-by-file view
     files_with_issues = {}
     files_clean = []
+    files_with_errors = []
     
     total_issues = 0
+    seen_issue_keys = set()  # Global deduplication across files
+    
     for file_path, data in findings_db.items():
+        # Check for scan errors
+        if 'scan_error' in data:
+            files_with_errors.append({
+                'file': file_path,
+                'error_type': data['scan_error'].get('type', 'unknown'),
+                'error_message': data['scan_error'].get('message', ''),
+                'scanned_at': data.get('scanned_at', 'unknown')
+            })
+        
         findings = data.get('findings', [])
         if not findings:
             files_clean.append(file_path)
@@ -290,7 +523,13 @@ def generate_report(findings_db):
             'low_count': 0
         }
         
+        # Deduplicate issues within file and across files
         for issue in findings:
+            issue_key_hash = issue_key(issue)
+            if issue_key_hash in seen_issue_keys:
+                continue  # Skip duplicate
+            seen_issue_keys.add(issue_key_hash)
+            
             issue_copy = issue.copy()
             issue_copy['file'] = file_path
             issue_copy['scanned_at'] = data.get('scanned_at', 'unknown')
@@ -324,6 +563,7 @@ def generate_report(findings_db):
 | **🔴 High Priority** | {len(high_priority):,} |
 | **🟡 Medium Priority** | {len(medium_priority):,} |
 | **🟢 Low Priority** | {len(low_priority):,} |
+| **⚠️ Files with Scan Errors** | {len(files_with_errors):,} |
 
 **Issue Rate:** {(len(files_with_issues) / len(findings_db) * 100) if len(findings_db) > 0 else 0:.1f}% of files have issues
 
@@ -348,6 +588,8 @@ def generate_report(findings_db):
             
             for idx, issue in enumerate(file_issues, 1):
                 report += f"#### Issue #{idx}: {issue.get('type', 'unknown').upper()}\n\n"
+                if issue.get('cwe'):
+                    report += f"**CWE:** {issue['cwe']}\n\n"
                 report += f"{issue['description']}\n\n"
                 if issue.get('line_hint'):
                     report += f"**Code Snippet:**\n```\n{issue['line_hint']}\n```\n\n"
@@ -370,7 +612,8 @@ def generate_report(findings_db):
             report += f"*{len(file_issues)} issue(s)*\n\n"
             
             for idx, issue in enumerate(file_issues, 1):
-                report += f"**{issue.get('type', 'unknown').upper()}:** {issue['description']}\n"
+                cwe_str = f" [{issue['cwe']}]" if issue.get('cwe') else ""
+                report += f"**{issue.get('type', 'unknown').upper()}{cwe_str}:** {issue['description']}\n"
                 if issue.get('line_hint'):
                     report += f"\n```\n{issue['line_hint']}\n```\n"
                 report += "\n"
@@ -422,6 +665,20 @@ def generate_report(findings_db):
         for issue_type, counts in sorted(issue_types.items()):
             total = counts['high'] + counts['medium'] + counts['low']
             report += f"| {issue_type} | {counts['high']} | {counts['medium']} | {counts['low']} | **{total}** |\n"
+    
+    # Add section for files with scan errors
+    if files_with_errors:
+        report += f"\n---\n\n## ⚠️ Files with Scan Errors ({len(files_with_errors)})\n\n"
+        report += "These files encountered errors during scanning and may need to be rescanned:\n\n"
+        report += "| File | Error Type | Error Message | Scanned At |\n"
+        report += "|------|------------|---------------|------------|\n"
+        for error_info in files_with_errors:
+            file_path = error_info['file']
+            error_type = error_info['error_type']
+            error_msg = error_info['error_message'][:100] + "..." if len(error_info['error_message']) > 100 else error_info['error_message']
+            scanned = error_info['scanned_at'].split('T')[0] if 'T' in error_info['scanned_at'] else error_info['scanned_at']
+            report += f"| `{file_path}` | {error_type} | {error_msg} | {scanned} |\n"
+        report += f"\n💡 **Tip:** Files with connection errors can be rescanned by deleting their entry from `code_analysis_findings.json` or running the scanner again (it will skip unchanged files).\n\n"
     
     with open('code_analysis_report.md', 'w') as f:
         f.write(report)
